@@ -1,0 +1,31 @@
+# 新規インストール後に envbackup で復元を始める
+
+最後の更新: @DATE@（ホスト @HOST@）。このフォルダは、バックアップのたびに上書きされます。
+
+このフォルダの隣の `@USB_DIR@/` が、restic のリポジトリです。暗号化してあります。
+復元には、**バックアップのパスフレーズ**が必要です。キーリングとは別に控えておいたものを使います。
+
+## 1. ツールを入れる
+```
+sudo pacman -S --needed restic
+cp -r /path/to/Transfer/envbackup-tool/tool ~/omarchy-envbackup
+bash ~/omarchy-envbackup/install.sh
+cp /path/to/Transfer/envbackup-tool/config.sh ~/.config/envbackup/config.sh   # NET_REPO の認証情報は *** に伏せてある
+envbackup setup        # 同じパスフレーズを入力する（リポジトリは作成済みなので、そのまま使う）
+```
+
+## 2. 戻す
+- ファイル単位: `envbackup restore-file`、または `envbackup mount`
+- ツールを使わずに restic だけで戻す場合:
+```
+R=/path/to/Transfer/@USB_DIR@
+restic -r $R snapshots
+restic -r $R restore latest --tag home --host @HOST@ --target ~/restore/home          # ホーム
+restic -r $R dump --tag system --host @HOST@ latest /system.tar > ~/restore/system.tar  # システム（tar）
+```
+
+## 戻さないもの（J715 の場合）
+- `/etc/fstab`、ESP と boot.bin、`/etc/machine-id`、`/etc/m4-install-complete`
+- カーネル、J715 の音声のファイル
+
+これらは、新規インストールで作られたものが正しいので、バックアップから戻しません。

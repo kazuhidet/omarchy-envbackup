@@ -1,0 +1,298 @@
+#!/bin/bash
+# envbackup: Omarchy の環境（ホーム、システムの設定、パッケージの一覧）を restic で USB とネットワークにバックアップする。
+#
+#   envbackup setup          パスフレーズを GNOME キーリングに保存し、リポジトリを作る
+#   envbackup backup [-q]    今すぐバックアップ（-q: タイマー用。結果は通知で出す）
+#   envbackup status         リポジトリごとの最新のスナップショット
+#   envbackup snapshots      スナップショットの一覧
+#   envbackup restore-file   ファイルを 1 つ選んで取り出す（必要なら元の場所に戻す）
+#   envbackup mount          スナップショットをフォルダとして開く
+#   envbackup export-tool    ツール一式と BOOTSTRAP.md を USB に置く（バックアップのたびにも自動で行う）
+#   envbackup menu           上の操作を選ぶ画面（Omarchy のメニューから開く）
+set -euo pipefail
+
+APP=envbackup
+# テスト用に、キーリングの名前と設定ファイル・状態のフォルダを差し替えられる
+SECRET_ID=${ENVBACKUP_SECRET_ID:-$APP}
+CONF_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/$APP
+CONF=${ENVBACKUP_CONFIG:-$CONF_DIR/config.sh}
+STATE_DIR=${ENVBACKUP_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/$APP}
+LISTS_DIR=$STATE_DIR/lists
+LOG_DIR=$STATE_DIR/log
+SYSTAR=/usr/local/libexec/envbackup-systar
+RESTORE_ROOT=$HOME/envbackup-restore
+MOUNT_DIR=$HOME/envbackup-mount
+HOST=$(hostname)
+
+# shellcheck source=config.default.sh
+[ -f "$CONF" ] || { echo "設定がありません: $CONF（install.sh を実行してください）" >&2; exit 1; }
+source "$CONF"
+
+export RESTIC_PASSWORD_COMMAND="secret-tool lookup service $SECRET_ID"
+
+QUIET=0
+say()  { [ $QUIET = 1 ] || echo -e "$*"; }
+warn() { echo -e "\e[33m$*\e[0m" >&2; }
+die()  { echo -e "\e[31m$*\e[0m" >&2; exit 1; }
+notify() { command -v notify-send >/dev/null && notify-send -a "Backup" "$@" || true; }
+
+have_password() { secret-tool lookup service "$SECRET_ID" >/dev/null 2>&1; }
+
+# USB のボリュームを探す。挿してあってマウントされていなければ udisks でマウントする。
+usb_mountpoint() {
+  local dev=/dev/disk/by-label/$USB_LABEL mp
+  [ -e "$dev" ] || return 1
+  mp=$(findmnt -rn -S "LABEL=$USB_LABEL" -o TARGET | head -1)
+  if [ -z "$mp" ]; then
+    udisksctl mount -b "$dev" --no-user-interaction >/dev/null 2>&1 || return 1
+    mp=$(findmnt -rn -S "LABEL=$USB_LABEL" -o TARGET | head -1)
+  fi
+  [ -n "$mp" ] && echo "$mp"
+}
+
+# 使えるリポジトリを "名前<TAB>URL" で並べる
+repos() {
+  local mp
+  if mp=$(usb_mountpoint); then printf 'usb\t%s\n' "$mp/$USB_DIR"; fi
+  if [ -n "${NET_REPO:-}" ]; then printf 'net\t%s\n' "$NET_REPO"; fi
+}
+
+repo_ok() { restic -r "$1" cat config >/dev/null 2>&1; }
+
+pick_repo() {
+  local rows
+  rows=$(repos)
+  [ -n "$rows" ] || die "使えるリポジトリがありません（USB を挿すか、NET_REPO を設定してください）"
+  if [ "$(wc -l <<<"$rows")" = 1 ]; then cut -f2 <<<"$rows"; return; fi
+  gum choose --header "リポジトリ" $(cut -f1 <<<"$rows") | { read -r n; awk -F'\t' -v n="$n" '$1==n{print $2}' <<<"$rows"; }
+}
+
+cmd_setup() {
+  command -v restic >/dev/null || die "restic がありません: sudo pacman -S restic"
+  if have_password; then
+    say "パスフレーズはキーリングに保存済みです。"
+  else
+    local p1 p2
+    p1=$(gum input --password --placeholder "バックアップのパスフレーズ（忘れると復元できません）")
+    p2=$(gum input --password --placeholder "もう一度")
+    [ -n "$p1" ] && [ "$p1" = "$p2" ] || die "パスフレーズが空か、一致しません"
+    printf '%s' "$p1" | secret-tool store --label="envbackup (restic)" service "$SECRET_ID"
+    unset p1 p2
+    say "パスフレーズを GNOME キーリングに保存しました。"
+  fi
+  local name url
+  while IFS=$'\t' read -r name url; do
+    if repo_ok "$url"; then say "$name: $url（作成済み）"
+    else say "$name: $url を作ります"; restic -r "$url" init; fi
+  done < <(repos)
+}
+
+# 復元のときの判断に使う一覧（ホームのスナップショットに一緒に入る）
+make_lists() {
+  local L=$LISTS_DIR
+  mkdir -p "$L"
+  pacman -Q   > "$L/pacman-Q-all-versions.txt"
+  pacman -Qqe > "$L/pacman-explicit.txt"
+  pacman -Qqen > "$L/pacman-explicit-native.txt"
+  pacman -Qqem > "$L/pacman-explicit-foreign-aur.txt" || true
+  sudo -n pacman -Qkk 2>/dev/null | grep -vE ': [0-9]+ total files, 0 altered files$' > "$L/pacman-Qkk-altered.txt" || true
+  cp /etc/pacman.conf /etc/pacman.d/mirrorlist "$L/"
+  systemctl list-unit-files --state=enabled,masked --no-pager > "$L/systemd-system-enabled-masked.txt" || true
+  systemctl --user list-unit-files --state=enabled,masked --no-pager > "$L/systemd-user-enabled-masked.txt" || true
+  { sudo -n find /etc /usr /opt -xdev \( -type f -o -type l \) 2>/dev/null || true; } | sort > "$L/.all"
+  pacman -Qlq | grep -v '/$' | sort -u > "$L/.owned"
+  comm -23 "$L/.all" "$L/.owned" > "$L/unowned-files.txt"; rm -f "$L/.all" "$L/.owned"
+  for k in /etc/ssh/ssh_host_*_key.pub; do [ -e "$k" ] && { ssh-keygen -lf "$k" 2>/dev/null || true; }; done > "$L/ssh-host-key-fingerprints.txt"
+  mise ls > "$L/mise-ls.txt" 2>&1 || true
+  lsblk -o NAME,SIZE,FSTYPE,LABEL,PARTTYPENAME,UUID > "$L/lsblk.txt"
+  cat /proc/cmdline > "$L/proc-cmdline.txt"
+  { uname -r; omarchy version 2>/dev/null || true; date -Is; } > "$L/system-info.txt"
+}
+
+# restic を実行する。3（読めないファイルがあったが、スナップショットはできた）は警告にとどめる。
+rs() {
+  local rc=0
+  restic "$@" || rc=$?
+  [ $rc = 3 ] && { warn "一部のファイルが読めませんでした（スナップショットは作成済み）"; rc=0; }
+  return $rc
+}
+
+backup_one() {
+  local name=$1 url=$2 ex=() e
+  for e in "${HOME_EXCLUDES[@]}"; do ex+=(--exclude "$e"); done
+  local quiet=(); [ $QUIET = 1 ] && quiet=(-q)
+
+  say "\n== $name: ホーム"
+  rs -r "$url" backup "${quiet[@]}" --host "$HOST" --tag home --exclude-caches "${ex[@]}" "$HOME" || return 1
+
+  say "\n== $name: システム（root の tar）"
+  rs -r "$url" backup "${quiet[@]}" --host "$HOST" --tag system \
+    --stdin-filename system.tar --stdin-from-command -- sudo -n "$SYSTAR" "${SYSTEM_PATHS[@]}" || return 1
+
+  if [ "${PKGCACHE:-0}" = 1 ]; then
+    say "\n== $name: pacman のキャッシュ"
+    rs -r "$url" backup "${quiet[@]}" --host "$HOST" --tag pkgcache /var/cache/pacman/pkg || return 1
+  fi
+
+  say "\n== $name: 古いスナップショットの整理"
+  local prune=(); [ "$(date +%u)" = "${PRUNE_WEEKDAY:-7}" ] && prune=(--prune)
+  rs -r "$url" forget "${quiet[@]}" --host "$HOST" --group-by host,tags "${KEEP[@]}" "${prune[@]}" || return 1
+}
+
+# 新規インストールの直後に使えるように、ツール一式を暗号化せずに USB に置く（秘密の情報は含まない）。
+copy_tool_to_usb() {
+  local mp src dst
+  mp=$(usb_mountpoint) || return 1
+  src=$(dirname "$(readlink -f "$0")")
+  dst=$mp/envbackup-tool
+  mkdir -p "$dst"
+  rsync -rt --delete --exclude .git "$src/" "$dst/tool/"
+  # NET_REPO の URL に含まれるかもしれない認証情報（user:pass@）は伏せる
+  sed -E 's#(://)[^/@]+@#\1***@#' "$CONF" > "$dst/config.sh"
+  sed -e "s#@HOST@#$HOST#g" -e "s#@USB_DIR@#$USB_DIR#g" -e "s#@DATE@#$(date '+%F %T')#g" \
+    "$src/BOOTSTRAP.md.in" > "$dst/BOOTSTRAP.md"
+}
+
+cmd_backup() {
+  if [ "${1:-}" = -q ]; then QUIET=1; else export RESTIC_PROGRESS_FPS=0.5; fi
+  mkdir -p "$LOG_DIR"
+  local log=$LOG_DIR/$(date +%Y%m%d-%H%M%S).log
+  exec 9>"$STATE_DIR/lock"
+  flock -n 9 || die "別のバックアップが実行中です"
+  have_password || { notify -u critical "バックアップできません" "パスフレーズが未設定です（envbackup setup）"; die "パスフレーズが未設定です: envbackup setup"; }
+  sudo -n true 2>/dev/null || { notify -u critical "バックアップできません" "sudo にパスワードが必要です"; die "sudo -n が使えません"; }
+
+  local rows done_=() failed=() name url
+  rows=$(repos)
+  if [ -z "$rows" ]; then
+    notify "バックアップを飛ばしました" "USB もネットワークも使えません"
+    die "使えるリポジトリがありません"
+  fi
+
+  say "一覧を作っています…"
+  make_lists
+  while IFS=$'\t' read -r name url; do
+    if ! repo_ok "$url"; then warn "$name: リポジトリに届かないか、未作成です（$url）"; failed+=("$name"); continue; fi
+    if backup_one "$name" "$url" > >(tee -a "$log") 2> >(tee -a "$log" >&2); then done_+=("$name")
+    else failed+=("$name"); fi
+  done <<<"$rows"
+
+  [[ " ${done_[*]:-} " == *" usb "* ]] && { copy_tool_to_usb || warn "ツールの控えを USB に置けませんでした"; }
+
+  printf '%s\tok=%s\tfailed=%s\n' "$(date -Is)" "${done_[*]:-}" "${failed[*]:-}" >> "$STATE_DIR/history.tsv"
+  find "$LOG_DIR" -name '*.log' -mtime +30 -delete 2>/dev/null || true
+  if [ ${#failed[@]} -gt 0 ]; then
+    notify -u critical "バックアップに失敗" "失敗: ${failed[*]}  成功: ${done_[*]:-なし}\nログ: $log"; return 1
+  fi
+  notify "バックアップ完了" "${done_[*]}"
+  say "\n完了: ${done_[*]}"
+}
+
+cmd_status() {
+  local name url
+  [ -f "$STATE_DIR/history.tsv" ] && { echo "最近の実行:"; tail -3 "$STATE_DIR/history.tsv"; echo; }
+  while IFS=$'\t' read -r name url; do
+    echo "== $name ($url)"
+    if repo_ok "$url"; then restic -r "$url" snapshots --host "$HOST" --latest 1 --compact
+    else echo "  届かないか、未作成です"; fi
+  done < <(repos)
+  [ -n "${NET_REPO:-}" ] || echo "（ネットワークのリポジトリは未設定: $CONF の NET_REPO）"
+}
+
+cmd_snapshots() {
+  local url; url=$(pick_repo)
+  restic -r "$url" snapshots --host "$HOST" --compact
+}
+
+# スナップショットを選ぶ。$1 = タグ
+pick_snapshot() {
+  local url=$1 tag=$2 line
+  line=$(restic -r "$url" snapshots --host "$HOST" --tag "$tag" --json \
+    | jq -r '.[] | "\(.short_id)  \(.time[0:16] | sub("T";" "))"' | sort -k2 -r \
+    | gum choose --header "スナップショット（$tag）") || return 1
+  awk '{print $1}' <<<"$line"
+}
+
+# 取り出したファイルを、差分を見せてから元の場所に戻す。$1=取り出したもの $2=元の場所 $3=root なら 1
+offer_put_back() {
+  local got=$1 dest=$2 asroot=$3 run=(); [ "$asroot" = 1 ] && run=(sudo -n)
+  if "${run[@]}" test -e "$dest"; then
+    if "${run[@]}" test -f "$dest"; then
+      echo "── 差分（- 今 / + スナップショット）"
+      "${run[@]}" diff -u "$dest" "$got" | head -80 || true
+    fi
+    gum confirm "元の場所（$dest）を、スナップショットの内容で置き換えますか？今のものは .envbackup-$(date +%Y%m%d%H%M%S) を付けて残します。" || return 0
+    "${run[@]}" mv "$dest" "$dest.envbackup-$(date +%Y%m%d%H%M%S)"
+  else
+    gum confirm "元の場所（$dest）には今は何もありません。戻しますか？" || return 0
+    "${run[@]}" mkdir -p "$(dirname "$dest")"
+  fi
+  "${run[@]}" cp -a "$got" "$dest"
+  echo "戻しました: $dest"
+}
+
+cmd_restore_file() {
+  local url kind snap path ts out
+  url=$(pick_repo)
+  kind=$(gum choose --header "どれから取り出しますか" "ホーム" "システム（/etc など）") || return 0
+  ts=$(date +%Y%m%d-%H%M%S)
+  if [ "$kind" = "ホーム" ]; then
+    snap=$(pick_snapshot "$url" home) || return 0
+    echo "ファイルの一覧を読んでいます…"
+    path=$(restic -r "$url" ls "$snap" | grep "^$HOME/" | gum filter --placeholder "取り出すファイルかフォルダ") || return 0
+    out=$RESTORE_ROOT/$ts
+    restic -r "$url" restore "$snap" --include "$path" --target "$out"
+    echo "取り出しました: $out$path"
+    offer_put_back "$out$path" "$path" 0
+  else
+    snap=$(pick_snapshot "$url" system) || return 0
+    echo "system.tar の一覧を読んでいます…"
+    path=$(restic -r "$url" dump "$snap" /system.tar | tar -tf - | grep -v '/$' | gum filter --placeholder "取り出すファイル（/ からの相対パス）") || return 0
+    out=$RESTORE_ROOT/$ts/sys
+    mkdir -p "$out"
+    restic -r "$url" dump "$snap" /system.tar | sudo -n tar -C "$out" --xattrs --acls --numeric-owner -xpf - "$path"
+    echo "取り出しました: $out/$path（root の所有のまま）"
+    offer_put_back "$out/$path" "/$path" 1
+  fi
+  echo "取り出したものは $RESTORE_ROOT に残っています。要らなくなったら消してください（システムのものは sudo rm -rf）。"
+}
+
+cmd_mount() {
+  local url; url=$(pick_repo)
+  mkdir -p "$MOUNT_DIR"
+  echo "$MOUNT_DIR に開きます。ファイラーで見られます。終わるときは Ctrl+C。"
+  (sleep 3; command -v nautilus >/dev/null && setsid nautilus "$MOUNT_DIR/hosts/$HOST" >/dev/null 2>&1 &) &
+  restic -r "$url" mount "$MOUNT_DIR"
+}
+
+cmd_menu() {
+  local c
+  while true; do
+    c=$(gum choose --header "環境のバックアップ" \
+      "今すぐバックアップ" "状態" "スナップショット一覧" "ファイルを取り出す" "フォルダとして開く" \
+      "設定ファイルを開く" "パスフレーズとリポジトリの準備" "終了") || return 0
+    case $c in
+      今すぐバックアップ) cmd_backup || true ;;
+      状態) cmd_status || true ;;
+      スナップショット一覧) cmd_snapshots || true ;;
+      ファイルを取り出す) cmd_restore_file || true ;;
+      フォルダとして開く) cmd_mount || true ;;
+      設定ファイルを開く) ${EDITOR:-nvim} "$CONF" ;;
+      パスフレーズとリポジトリの準備) cmd_setup || true ;;
+      終了) return 0 ;;
+    esac
+    echo; gum input --placeholder "Enter で戻る" >/dev/null || true
+  done
+}
+
+case "${1:-menu}" in
+  setup) cmd_setup ;;
+  backup) shift; cmd_backup "$@" ;;
+  status) cmd_status ;;
+  snapshots) cmd_snapshots ;;
+  restore-file) cmd_restore_file ;;
+  mount) cmd_mount ;;
+  export-tool) copy_tool_to_usb && echo "USB に置きました: $(usb_mountpoint)/envbackup-tool" ;;
+  menu) cmd_menu ;;
+  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

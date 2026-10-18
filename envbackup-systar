@@ -1,0 +1,13 @@
+#!/bin/bash
+# root で実行し、システムのファイルを tar にして標準出力に書く（restic --stdin-from-command から呼ばれる）。
+# 引数: / からの相対パス。存在しないものは飛ばす。
+set -uo pipefail
+[ "$(id -u)" = 0 ] || { echo "envbackup-systar: root で実行してください" >&2; exit 1; }
+paths=()
+for p in "$@"; do [ -e "/$p" ] && paths+=("$p"); done
+[ ${#paths[@]} -gt 0 ] || { echo "envbackup-systar: 対象がありません" >&2; exit 1; }
+tar -C / --xattrs --acls --numeric-owner --warning=no-file-changed --warning=no-file-removed \
+    --warning=no-file-ignored -cpf - "${paths[@]}"
+rc=$?
+# 1 = 読んでいる途中でファイルが変わった（よくある。失敗にはしない）
+[ $rc -le 1 ] && exit 0 || exit $rc

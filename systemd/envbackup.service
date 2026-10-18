@@ -1,0 +1,9 @@
+[Unit]
+Description=Environment backup (restic, USB and network)
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/envbackup backup -q
+Nice=10
+IOSchedulingClass=idle
