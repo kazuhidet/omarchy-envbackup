@@ -1,0 +1,78 @@
+#!/usr/bin/python3 -I
+"""Run restic backup as the invoking user, with DAC read/search permission only.
+
+Install root-owned at /usr/local/libexec/envbackup-read. The user's environment
+arrives as JSON on stdin and is used only AFTER dropping root, preserving the
+keyring session, SSH agent, remote credentials and ownership of repository files.
+"""
+import json
+import os
+from pathlib import Path
+import pwd
+import sys
+
+
+READ_CAP = 1 << 2  # CAP_DAC_READ_SEARCH
+
+
+def capability_sets():
+    return {key: int(value.strip(), 16)
+            for line in Path('/proc/self/status').read_text().splitlines()
+            for key, _, value in [line.partition(':')]
+            if key in ('CapEff', 'CapPrm', 'CapInh', 'CapAmb', 'CapBnd')}
+
+
+def launch(cap_names=('dac_read_search',), operations=('backup',), entrypoint=None,
+           apply_script=None):
+    cap_numbers = {'chown': 0, 'dac_override': 1, 'dac_read_search': 2,
+                   'fowner': 3, 'fsetid': 4, 'setfcap': 31}
+    expected = sum(1 << cap_numbers[name] for name in cap_names)
+    cap_spec = '-all,' + ','.join('+' + name for name in cap_names)
+    if os.geteuid() == 0:
+        uid = int(os.environ.get('SUDO_UID', '0'))
+        if uid <= 0:
+            raise ValueError('通常ユーザーから sudo 経由で実行してください')
+        account = pwd.getpwuid(uid)
+        executable = '/usr/bin/setpriv'
+        args = [executable, f'--reuid={uid}', f'--regid={account.pw_gid}',
+                '--init-groups', '--bounding-set=' + cap_spec,
+                '--inh-caps=' + cap_spec,
+                '--ambient-caps=' + cap_spec, '--no-new-privs',
+                '/usr/bin/python3', '-I', str(entrypoint or Path(__file__).resolve()),
+                '--as-user', *sys.argv[1:]]
+        # Do not pass user-controlled environment to any root executable.
+        os.execve(executable, args, {'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'})
+    if not sys.argv[1:] or sys.argv[1] != '--as-user':
+        raise ValueError('sudo -n /usr/local/libexec/envbackup-read から実行してください')
+    caps = capability_sets()
+    if set(caps.values()) != {expected} or len(caps) != 5:
+        raise ValueError('読み取り用 capability を設定できませんでした')
+    args = sys.argv[2:]
+    if args == ['--check']:
+        print('envbackup: UID を維持し、必要なファイル操作権限を確認しました')
+        return
+    if not args or args[0] not in operations:
+        raise ValueError('このヘルパーで許可されていない操作です')
+    env = json.load(sys.stdin)
+    if not isinstance(env, dict) or any(not isinstance(k, str) or not isinstance(v, str)
+                                        or '=' in k or '\x00' in k + v for k, v in env.items()):
+        raise ValueError('環境変数の形式が不正です')
+    # Root identity must never leak to restic or its credential providers.
+    account = pwd.getpwuid(os.getuid())
+    env.update(USER=account.pw_name, LOGNAME=account.pw_name)
+    env.setdefault('HOME', account.pw_dir)
+    null = os.open('/dev/null', os.O_RDONLY)
+    os.dup2(null, 0)
+    if null != 0:
+        os.close(null)
+    if args[0] == 'apply-home':
+        os.execve('/usr/bin/python3', ['python3', '-I', str(apply_script), *args[1:]], env)
+    os.execve('/usr/bin/restic', ['restic', '--retry-lock', '30s', *args], env)
+
+
+if __name__ == '__main__':
+    try:
+        launch()
+    except (OSError, ValueError, KeyError) as exc:
+        print(f'envbackup-read: {exc}', file=sys.stderr)
+        sys.exit(1)

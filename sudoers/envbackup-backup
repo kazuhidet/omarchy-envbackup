@@ -1,0 +1,10 @@
+# User: kazu. Install as /etc/sudoers.d/envbackup-backup (root:root, 0440).
+# Matches config.default.sh SYSTEM_PATHS exactly; update when paths change.
+# The helper and its parent directories must be root-owned and not user-writable.
+kazu ALL=(root) NOPASSWD: /usr/bin/true ""
+# Drops root before running restic, retaining only CAP_DAC_READ_SEARCH.
+# This allows reading all local users' files, including root-owned home files.
+kazu ALL=(root) NOPASSWD: /usr/local/libexec/envbackup-read
+kazu ALL=(root) NOPASSWD: /usr/bin/pacman -Qkk
+kazu ALL=(root) NOPASSWD: /usr/bin/find /etc /usr /opt -xdev ( -type f -o -type l )
+kazu ALL=(root) NOPASSWD: /usr/local/libexec/envbackup-systar etc root opt usr/local var/lib/j715 var/lib/bluetooth var/lib/NetworkManager var/lib/iwd var/lib/fprint

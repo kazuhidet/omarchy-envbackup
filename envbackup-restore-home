@@ -1,0 +1,16 @@
+#!/usr/bin/python3 -I
+"""Explicitly privileged home restore. Not authorized by the backup policy."""
+from pathlib import Path
+import runpy
+import sys
+
+if __name__ == '__main__':
+    try:
+        helper = runpy.run_path('/usr/local/libexec/envbackup-read')
+        helper['launch'](
+            cap_names=('chown', 'dac_override', 'dac_read_search', 'fowner', 'fsetid', 'setfcap'),
+            operations=('restore', 'apply-home'), entrypoint=Path(__file__).resolve(),
+            apply_script='/usr/local/libexec/envbackup-restore-wizard.py')
+    except (OSError, ValueError, KeyError) as exc:
+        print(f'envbackup-restore-home: {exc}', file=sys.stderr)
+        sys.exit(1)

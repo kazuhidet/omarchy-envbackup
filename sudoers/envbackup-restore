@@ -1,0 +1,6 @@
+# OPTIONAL: system restore only. Requires envbackup-backup for backups.
+# Install as /etc/sudoers.d/envbackup-restore (root:root, 0440).
+# WARNING: tar/mv/cp allow arbitrary root writes, effectively full root access.
+# No arguments after a command path means ANY arguments are permitted.
+kazu ALL=(root) NOPASSWD: /usr/local/libexec/envbackup-restore-home
+kazu ALL=(root) NOPASSWD: /usr/bin/tar, /usr/bin/test, /usr/bin/diff, /usr/bin/mv, /usr/bin/mkdir, /usr/bin/cp

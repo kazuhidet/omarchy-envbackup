@@ -5,7 +5,9 @@
 #   envbackup backup [-q]    今すぐバックアップ（-q: タイマー用。結果は通知で出す）
 #   envbackup status         リポジトリごとの最新のスナップショット
 #   envbackup snapshots      スナップショットの一覧
+#   envbackup unlock         リポジトリの古いロックだけを解除する
 #   envbackup restore-file   ファイルを 1 つ選んで取り出す（必要なら元の場所に戻す）
+#   envbackup restore        新規インストール後の全体復元ウィザード
 #   envbackup mount          スナップショットをフォルダとして開く
 #   envbackup export-tool    ツール一式と BOOTSTRAP.md を USB に置く（バックアップのたびにも自動で行う）
 #   envbackup menu           上の操作を選ぶ画面（Omarchy のメニューから開く）
@@ -20,6 +22,7 @@ STATE_DIR=${ENVBACKUP_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/$APP}
 LISTS_DIR=$STATE_DIR/lists
 LOG_DIR=$STATE_DIR/log
 SYSTAR=/usr/local/libexec/envbackup-systar
+READ_HELPER=/usr/local/libexec/envbackup-read
 RESTORE_ROOT=$HOME/envbackup-restore
 MOUNT_DIR=$HOME/envbackup-mount
 HOST=$(hostname)
@@ -109,30 +112,47 @@ make_lists() {
   { uname -r; omarchy version 2>/dev/null || true; date -Is; } > "$L/system-info.txt"
 }
 
-# restic を実行する。3（読めないファイルがあったが、スナップショットはできた）は警告にとどめる。
+# 読めないファイルがあるスナップショットを成功扱いにしない。
+restic_result() {
+  local rc=$1
+  [ "$rc" != 3 ] || warn "バックアップは不完全です: 読めなかったファイルがあります（スナップショットは作成済み）"
+  [ "$rc" != 11 ] || warn "リポジトリがロックされています。実行中の処理を確認し、envbackup unlock で古いロックだけを解除してください"
+  return "$rc"
+}
+
 rs() {
   local rc=0
-  restic "$@" || rc=$?
-  [ $rc = 3 ] && { warn "一部のファイルが読めませんでした（スナップショットは作成済み）"; rc=0; }
-  return $rc
+  restic --retry-lock 30s "$@" || rc=$?
+  restic_result "$rc"
+}
+
+rs_read() {
+  local rc=0
+  # Credentials go through a pipe, not argv or a plaintext temporary file.
+  python3 -I -c 'import json, os, sys; json.dump(dict(os.environ), sys.stdout)' \
+    | sudo -n "$READ_HELPER" backup "$@" || rc=$?
+  restic_result "$rc"
 }
 
 backup_one() {
-  local name=$1 url=$2 ex=() e
+  local name=$1 url=$2 ex=() e incomplete=0
   for e in "${HOME_EXCLUDES[@]}"; do ex+=(--exclude "$e"); done
   local quiet=(); [ $QUIET = 1 ] && quiet=(-q)
 
   say "\n== $name: ホーム"
-  rs -r "$url" backup "${quiet[@]}" --host "$HOST" --tag home --exclude-caches "${ex[@]}" "$HOME" || return 1
+  rs_read -r "$url" "${quiet[@]}" --host "$HOST" --tag home --exclude-caches "${ex[@]}" "$HOME" || incomplete=1
 
   say "\n== $name: システム（root の tar）"
   rs -r "$url" backup "${quiet[@]}" --host "$HOST" --tag system \
-    --stdin-filename system.tar --stdin-from-command -- sudo -n "$SYSTAR" "${SYSTEM_PATHS[@]}" || return 1
+    --stdin-filename system.tar --stdin-from-command -- sudo -n "$SYSTAR" "${SYSTEM_PATHS[@]}" || incomplete=1
 
   if [ "${PKGCACHE:-0}" = 1 ]; then
     say "\n== $name: pacman のキャッシュ"
-    rs -r "$url" backup "${quiet[@]}" --host "$HOST" --tag pkgcache /var/cache/pacman/pkg || return 1
+    rs_read -r "$url" "${quiet[@]}" --host "$HOST" --tag pkgcache /var/cache/pacman/pkg || incomplete=1
   fi
+
+  # Do not prune previous complete backups after a partial/failed run.
+  [ "$incomplete" = 0 ] || return 1
 
   say "\n== $name: 古いスナップショットの整理"
   local prune=(); [ "$(date +%u)" = "${PRUNE_WEEKDAY:-7}" ] && prune=(--prune)
@@ -160,7 +180,9 @@ cmd_backup() {
   exec 9>"$STATE_DIR/lock"
   flock -n 9 || die "別のバックアップが実行中です"
   have_password || { notify -u critical "バックアップできません" "パスフレーズが未設定です（envbackup setup）"; die "パスフレーズが未設定です: envbackup setup"; }
-  sudo -n true 2>/dev/null || { notify -u critical "バックアップできません" "sudo にパスワードが必要です"; die "sudo -n が使えません"; }
+  sudo -n true || { notify -u critical "バックアップできません" "sudo の設定を確認してください"; die "sudo -n が使えません（上の sudo エラーを確認してください）"; }
+  [ -f "$READ_HELPER" ] || die "読み取り用ヘルパーがありません。install.sh と NOPASSWD 設定を更新してください"
+  sudo -n "$READ_HELPER" --check || die "読み取り権限を準備できません。envbackup-read の設置・NOPASSWD 設定を確認してください"
 
   local rows done_=() failed=() name url
   rows=$(repos)
@@ -203,6 +225,16 @@ cmd_snapshots() {
   local url; url=$(pick_repo)
   restic -r "$url" snapshots --host "$HOST" --compact
 }
+
+cmd_unlock() (
+  mkdir -p "$STATE_DIR"
+  exec 9>"$STATE_DIR/lock"
+  flock -n 9 || die "別のバックアップまたは復元が実行中です"
+  local url
+  url=$(pick_repo) || exit 1
+  gum confirm "restic が古いと判断するロックだけを解除しますか？（実行中のロックは残します）" || exit 0
+  restic -r "$url" unlock
+)
 
 # スナップショットを選ぶ。$1 = タグ
 pick_snapshot() {
@@ -265,17 +297,29 @@ cmd_mount() {
   restic -r "$url" mount "$MOUNT_DIR"
 }
 
+cmd_restore() (
+  mkdir -p "$STATE_DIR"
+  exec 9>"$STATE_DIR/lock"
+  flock -n 9 || die "別のバックアップまたは復元が実行中です"
+  local url
+  url=$(pick_repo) || exit 1
+  python3 "$(dirname "$(readlink -f "$0")")/restore-wizard.py" \
+    --repo "$url" --home "$HOME" --work-root "$RESTORE_ROOT" \
+    --protect-home "$CONF_DIR" --protect-home "$CONF" --protect-home "$STATE_DIR"
+)
+
 cmd_menu() {
   local c
   while true; do
     c=$(gum choose --header "環境のバックアップ" \
-      "今すぐバックアップ" "状態" "スナップショット一覧" "ファイルを取り出す" "フォルダとして開く" \
+      "今すぐバックアップ" "状態" "スナップショット一覧" "ファイルを取り出す" "全体を復元する" "フォルダとして開く" \
       "設定ファイルを開く" "パスフレーズとリポジトリの準備" "終了") || return 0
     case $c in
       今すぐバックアップ) cmd_backup || true ;;
       状態) cmd_status || true ;;
       スナップショット一覧) cmd_snapshots || true ;;
       ファイルを取り出す) cmd_restore_file || true ;;
+      全体を復元する) cmd_restore || true ;;
       フォルダとして開く) cmd_mount || true ;;
       設定ファイルを開く) ${EDITOR:-nvim} "$CONF" ;;
       パスフレーズとリポジトリの準備) cmd_setup || true ;;
@@ -290,9 +334,11 @@ case "${1:-menu}" in
   backup) shift; cmd_backup "$@" ;;
   status) cmd_status ;;
   snapshots) cmd_snapshots ;;
+  unlock) cmd_unlock ;;
   restore-file) cmd_restore_file ;;
+  restore) cmd_restore ;;
   mount) cmd_mount ;;
   export-tool) copy_tool_to_usb && echo "USB に置きました: $(usb_mountpoint)/envbackup-tool" ;;
   menu) cmd_menu ;;
-  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

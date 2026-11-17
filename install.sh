@@ -1,16 +1,19 @@
 #!/bin/bash
-# envbackup を入れる（何度実行してもよい）。ユーザーで実行する。sudo を 1 回使う。
+# envbackup を入れる（何度実行してもよい）。ユーザーで実行し、システムへの配置に sudo を使う。
 set -euo pipefail
 SRC=$(cd "$(dirname "$0")" && pwd)
 
 command -v restic >/dev/null || sudo pacman -S --needed --noconfirm restic
-for c in gum jq secret-tool; do command -v $c >/dev/null || { echo "$c がありません" >&2; exit 1; }; done
+for c in gum jq secret-tool python3 setpriv; do command -v $c >/dev/null || { echo "$c がありません" >&2; exit 1; }; done
 
 mkdir -p ~/.local/bin ~/.config/envbackup ~/.config/systemd/user
 ln -sf "$SRC/envbackup" ~/.local/bin/envbackup
 chmod +x "$SRC/envbackup" "$SRC/envbackup-systar"
 # root で実行される部分は、root の所有の場所に置く（ユーザーが書き換えられないように）
 sudo install -D -m 0755 -o root -g root "$SRC/envbackup-systar" /usr/local/libexec/envbackup-systar
+sudo install -D -m 0755 -o root -g root "$SRC/envbackup-read" /usr/local/libexec/envbackup-read
+sudo install -D -m 0755 -o root -g root "$SRC/envbackup-restore-home" /usr/local/libexec/envbackup-restore-home
+sudo install -D -m 0755 -o root -g root "$SRC/restore-wizard.py" /usr/local/libexec/envbackup-restore-wizard.py
 
 [ -f ~/.config/envbackup/config.sh ] || cp "$SRC/config.default.sh" ~/.config/envbackup/config.sh
 
